@@ -1,0 +1,1 @@
+"""Enterprise cost simulation application."""

@@ -1,0 +1,26 @@
+item_code,item_name,material_group,base_cost,sales_price,oil_factor,fx_factor,steel_factor
+TY-ENG-001,Engine Assembly,Engine,145000,188500,0.08,0.32,0.18
+TY-ENG-002,Fuel Injection System,Engine,28500,37050,0.06,0.38,0.12
+TY-ENG-003,Turbocharger Module,Engine,42000,54600,0.05,0.45,0.16
+TY-TRN-001,Transmission Unit,Transmission,88000,114400,0.07,0.36,0.22
+TY-TRN-002,Torque Converter,Transmission,24500,31850,0.05,0.34,0.24
+TY-CHS-001,Suspension Set,Chassis,36000,46800,0.08,0.24,0.34
+TY-CHS-002,Brake System,Chassis,31500,40950,0.06,0.28,0.30
+TY-CHS-003,Steering Rack Assembly,Chassis,26500,34450,0.05,0.30,0.28
+TY-STL-001,Steel Body Frame,Steel Body,112000,145600,0.04,0.22,0.58
+TY-STL-002,Door Panel Set,Steel Body,38500,50050,0.04,0.20,0.62
+TY-STL-003,Hood and Fender Set,Steel Body,29500,38350,0.04,0.19,0.64
+TY-INT-001,Plastic Dashboard,Plastic Interior,18500,24050,0.36,0.26,0.04
+TY-INT-002,Seat Assembly,Plastic Interior,52000,67600,0.18,0.24,0.10
+TY-INT-003,Interior Trim Set,Plastic Interior,14800,19240,0.34,0.22,0.03
+TY-RBR-001,Rubber Tire Set,Rubber Tire,32000,41600,0.42,0.20,0.04
+TY-RBR-002,Engine Mount Rubber Set,Rubber Tire,8200,10660,0.38,0.18,0.08
+TY-ELC-001,ECU Control Unit,Electronics,45500,59150,0.03,0.62,0.04
+TY-ELC-002,Wiring Harness,Electronics,22500,29250,0.18,0.48,0.08
+TY-ELC-003,Infotainment Display,Electronics,28000,36400,0.04,0.66,0.03
+TY-BAT-001,Hybrid Battery Pack,Battery,165000,214500,0.03,0.58,0.12
+TY-BAT-002,Auxiliary Battery,Battery,12500,16250,0.04,0.42,0.10
+TY-PNT-001,Paint Coating,Paint,17500,22750,0.46,0.20,0.02
+TY-PNT-002,Primer and Sealant,Paint,9600,12480,0.40,0.18,0.03
+TY-LOG-001,Logistics/Freight,Logistics,42000,54600,0.55,0.28,0.02
+TY-LOG-002,Inbound Parts Handling,Logistics,18500,24050,0.48,0.24,0.02
