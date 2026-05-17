@@ -189,6 +189,31 @@ DASHBOARD_CSS = """
         line-height: 1.5;
         max-width: 980px;
     }
+    .exec-model-meta {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 18px;
+        max-width: 860px;
+    }
+    .exec-model-meta-item {
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 12px;
+        padding: 12px 14px;
+    }
+    .exec-model-meta-label {
+        color: #fecaca;
+        font-size: 0.74rem;
+        font-weight: 760;
+        margin-bottom: 5px;
+    }
+    .exec-model-meta-value {
+        color: #ffffff;
+        font-size: 1rem;
+        font-weight: 820;
+        overflow-wrap: anywhere;
+    }
     .exec-kpi-grid {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -369,6 +394,9 @@ DASHBOARD_CSS = """
         }
         .exec-hero {
             padding: 22px 20px;
+        }
+        .exec-model-meta {
+            grid-template-columns: 1fr;
         }
     }
     @media (max-width: 1100px) {
@@ -1275,11 +1303,24 @@ if dashboard_view == "executive":
                 <div class="exec-eyebrow">{escape(tr('app_title'))}</div>
                 <div class="exec-title">{escape(selected_vehicle['vehicle_name'])}</div>
                 <div class="exec-subtitle">{escape(str(selected_vehicle['description']))}</div>
+                <div class="exec-model-meta">
+                    <div class="exec-model-meta-item">
+                        <div class="exec-model-meta-label">{escape(tr('sales_price'))}</div>
+                        <div class="exec-model-meta-value">{escape(format_thb(selected_sales_price))}</div>
+                    </div>
+                    <div class="exec-model-meta-item">
+                        <div class="exec-model-meta-label">{escape(tr('target_gp'))}</div>
+                        <div class="exec-model-meta-value">{escape(format_pct(gp_target_percent))}</div>
+                    </div>
+                    <div class="exec-model-meta-item">
+                        <div class="exec-model-meta-label">{escape(tr('battery_kwh'))}</div>
+                        <div class="exec-model-meta-value">{escape(str(selected_vehicle['battery_kwh']))} kWh</div>
+                    </div>
+                </div>
             </div>
         </div>
         """
     )
-    display_vehicle_image(selected_vehicle["image_url"], str(selected_vehicle["vehicle_name"]))
 
     cost_trend = "&#8593;" if total_impact > 0 else "&#8595;" if total_impact < 0 else "&#8594;"
     gp_trend = "&#8593;" if total_gp_percent >= base_gp_percent else "&#8595;"

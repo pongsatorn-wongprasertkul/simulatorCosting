@@ -7,6 +7,7 @@ TRANSLATIONS = {
     "sales_price": "Sales Price",
     "model_description": "Model Description",
     "no_vehicle_image_available": "No vehicle image available",
+    "battery_kwh": "Battery kWh",
     "battery_budget_warning": "Battery benchmark cost is {calculated}, while allocated Battery System budget is {budget}. Battery subcomponents are scaled proportionally to the allocated benchmark budget.",
     "battery_share_warning": "Battery System share is {share}; EV benchmark guardrail is 30-40%.",
     "gp_target_warning": "Target GP is {gp}; benchmark guardrail is 18-30%.",

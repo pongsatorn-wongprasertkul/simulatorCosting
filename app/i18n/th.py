@@ -7,6 +7,7 @@ TRANSLATIONS = {
     "sales_price": "ราคาขาย",
     "model_description": "คำอธิบายรุ่น",
     "no_vehicle_image_available": "ไม่มีรูปภาพรถ",
+    "battery_kwh": "ความจุแบตเตอรี่ kWh",
     "battery_budget_warning": "ต้นทุนแบตเตอรี่ตาม benchmark อยู่ที่ {calculated} ขณะที่งบ Battery System ที่จัดสรรอยู่ที่ {budget} ระบบจึงปรับสัดส่วนชิ้นส่วนย่อยของแบตเตอรี่ให้เข้ากับงบ benchmark ที่จัดสรร",
     "battery_share_warning": "สัดส่วน Battery System อยู่ที่ {share} โดยกรอบ benchmark EV คือ 30-40%",
     "gp_target_warning": "เป้าหมาย GP อยู่ที่ {gp} โดยกรอบ benchmark คือ 18-30%",
