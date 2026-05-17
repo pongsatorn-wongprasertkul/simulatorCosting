@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 from html import escape
 from io import BytesIO
+import sys
 from textwrap import dedent
 
 import numpy as np
@@ -10,15 +11,22 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from app.engine.offset import OFFSET_CATEGORY_TO_COST_ELEMENT, calculate_offset_mitigation
 from app.i18n import THAI_LANGUAGE, TRANSLATIONS, translate, translate_value
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+ROOT_DATA_DIR = PROJECT_ROOT / "data"
+APP_DATA_DIR = PROJECT_ROOT / "app" / "data"
+DATA_DIR = ROOT_DATA_DIR if ROOT_DATA_DIR.exists() else APP_DATA_DIR
 PARTS_PATH = DATA_DIR / "vehicle_parts.csv"
 BREAKDOWN_PATH = DATA_DIR / "part_cost_breakdown.csv"
 SUPPLIER_PATH = DATA_DIR / "supplier_master.csv"
 SUPPLIER_MAP_PATH = DATA_DIR / "part_supplier_map.csv"
 SCENARIO_HISTORY_PATH = DATA_DIR / "scenario_history.csv"
+REQUIRED_DATA_PATHS = [PARTS_PATH, BREAKDOWN_PATH, SUPPLIER_PATH, SUPPLIER_MAP_PATH]
 
 VEHICLE_CODE = "BYD-SEAL-EV-TH"
 VEHICLE_NAME = "BYD Seal EV Enterprise Cost Model"
@@ -407,6 +415,12 @@ st.caption(f"{VEHICLE_CODE} | {VEHICLE_NAME}")
 
 @st.cache_data
 def load_vehicle_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    missing_paths = [path for path in REQUIRED_DATA_PATHS if not path.exists()]
+    if missing_paths:
+        missing_list = ", ".join(path.name for path in missing_paths)
+        st.error(f"Missing required data files: {missing_list}.")
+        st.stop()
+
     return (
         pd.read_csv(PARTS_PATH),
         pd.read_csv(BREAKDOWN_PATH),
@@ -511,6 +525,7 @@ def load_scenario_history() -> pd.DataFrame:
 
 
 def save_scenario(row: dict[str, object]) -> None:
+    SCENARIO_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     history = load_scenario_history()
     updated_history = pd.concat([history, pd.DataFrame([row])], ignore_index=True)
     updated_history.to_csv(SCENARIO_HISTORY_PATH, index=False)
