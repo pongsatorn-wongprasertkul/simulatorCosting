@@ -7,6 +7,7 @@ from textwrap import dedent
 
 import numpy as np
 from openpyxl import Workbook
+from openpyxl.styles import Font
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -15,6 +16,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.engine.cost_model import (
+    MODEL_COST_ALLOCATIONS,
+    build_supplier_exposure_by_part,
+    calculate_change_percent,
+    calculate_driver_impact_matrix,
+    calculate_element_impacts as calculate_benchmark_element_impacts,
+    calculate_target_total_cost,
+    calculate_vehicle_gp,
+    classify_financial_risk,
+)
 from app.engine.offset import OFFSET_CATEGORY_TO_COST_ELEMENT, calculate_offset_mitigation
 from app.i18n import THAI_LANGUAGE, TRANSLATIONS, translate, translate_value
 
@@ -439,10 +450,22 @@ def render_html(html: str) -> None:
 
 dashboard_view = st.sidebar.radio(
     tr("dashboard_view"),
-    ["executive", "analyst"],
-    format_func=lambda value: tr("executive_dashboard")
-    if value == "executive"
-    else tr("analyst_dashboard"),
+    [
+        "executive",
+        "cost_structure",
+        "supplier_risk_page",
+        "scenario_compare_page",
+        "monte_carlo_page",
+        "data_quality_page",
+    ],
+    format_func=lambda value: {
+        "executive": tr("executive_dashboard"),
+        "cost_structure": tr("cost_structure_bom"),
+        "supplier_risk_page": tr("supplier_risk"),
+        "scenario_compare_page": tr("scenario_compare"),
+        "monte_carlo_page": tr("monte_carlo_simulation"),
+        "data_quality_page": tr("data_quality"),
+    }[value],
 )
 
 
@@ -585,6 +608,73 @@ def localize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return localized
 
 
+def add_total_row(
+    frame: pd.DataFrame,
+    label_column: str | None = None,
+    sum_columns: list[str] | None = None,
+    weighted_average_columns: list[str] | None = None,
+    weight_column: str | None = None,
+    gp_percent_column: str | None = None,
+    gp_amount_column: str = "gp_amount",
+    sales_price_column: str = "sales_price",
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    display_frame = frame.copy()
+    sum_columns = sum_columns or [
+        column
+        for column in display_frame.select_dtypes(include="number").columns
+        if "%" not in column and column not in {gp_percent_column, "risk_score"}
+    ]
+    weighted_average_columns = weighted_average_columns or []
+
+    total_row: dict[str, object] = {column: "" for column in display_frame.columns}
+    if label_column and label_column in total_row:
+        total_row[label_column] = tr("total")
+    elif len(display_frame.columns) > 0:
+        total_row[display_frame.columns[0]] = tr("total")
+
+    for column in sum_columns:
+        if column in display_frame.columns:
+            total_row[column] = pd.to_numeric(display_frame[column], errors="coerce").sum()
+
+    if weight_column and weight_column in display_frame.columns:
+        weights = pd.to_numeric(display_frame[weight_column], errors="coerce").fillna(0)
+        weight_total = weights.sum()
+        for column in weighted_average_columns:
+            if column in display_frame.columns and weight_total:
+                values = pd.to_numeric(display_frame[column], errors="coerce").fillna(0)
+                total_row[column] = (values * weights).sum() / weight_total
+
+    if (
+        gp_percent_column
+        and gp_percent_column in display_frame.columns
+        and gp_amount_column in display_frame.columns
+        and sales_price_column in display_frame.columns
+    ):
+        total_sales = pd.to_numeric(display_frame[sales_price_column], errors="coerce").sum()
+        total_gp_amount = pd.to_numeric(display_frame[gp_amount_column], errors="coerce").sum()
+        total_row[gp_percent_column] = (
+            total_gp_amount / total_sales * 100 if total_sales else 0
+        )
+
+    return pd.concat([display_frame, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def style_total_row(frame: pd.DataFrame):
+    total_index = len(frame) - 1
+    return frame.style.apply(
+        lambda row: [
+            "font-weight: 700; background-color: #f1f5f9;"
+            if row.name == total_index
+            else ""
+            for _ in row
+        ],
+        axis=1,
+    )
+
+
 def load_scenario_history() -> pd.DataFrame:
     if not SCENARIO_HISTORY_PATH.exists():
         return pd.DataFrame()
@@ -618,49 +708,30 @@ def reset_to_base_case() -> None:
 
 
 def scenario_history_to_excel(history: pd.DataFrame) -> bytes:
+    export_history = add_total_row(
+        history,
+        label_column="scenario_name",
+        sum_columns=["sales_price", "total_vehicle_cost", "gp_amount"],
+        gp_percent_column="gp_percent",
+    )
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "Scenario History"
 
-    for column_index, column_name in enumerate(history.columns, start=1):
+    for column_index, column_name in enumerate(export_history.columns, start=1):
         worksheet.cell(row=1, column=column_index, value=column_name)
 
-    for row_index, (_, row) in enumerate(history.iterrows(), start=2):
+    for row_index, (_, row) in enumerate(export_history.iterrows(), start=2):
         for column_index, value in enumerate(row.tolist(), start=1):
             worksheet.cell(row=row_index, column=column_index, value=value)
+        if row_index == len(export_history) + 1:
+            for column_index in range(1, len(export_history.columns) + 1):
+                cell = worksheet.cell(row=row_index, column=column_index)
+                cell.font = Font(bold=True)
 
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
-
-
-def calculate_change_percent(current_price: float, scenario_price: float) -> float:
-    if current_price == 0:
-        return 0.0
-    return (scenario_price - current_price) / current_price
-
-
-def weighted_cost_element_impact(
-    row: pd.Series,
-    cost_element: str,
-    driver_changes: dict[str, float],
-) -> float:
-    drivers = COST_ELEMENT_DRIVER_MAP[cost_element]
-    sensitivity = sum(row[DRIVER_COLUMNS[driver]] for driver in drivers) / len(drivers)
-    change = sum(driver_changes[driver] for driver in drivers) / len(drivers)
-    return row["cost_amount"] * sensitivity * change
-
-
-def calculate_element_impacts(
-    breakdown: pd.DataFrame,
-    changes: dict[str, float],
-) -> pd.DataFrame:
-    impacted = breakdown.copy()
-    impacted["element_impact"] = impacted.apply(
-        lambda row: weighted_cost_element_impact(row, row["cost_element"], changes),
-        axis=1,
-    )
-    return impacted
 
 
 def classify_risk(score: float) -> str:
@@ -681,20 +752,6 @@ def classify_monte_carlo_risk(probability: float) -> str:
     if probability >= 0.15:
         return "Medium Risk"
     return "Low Risk"
-
-
-def build_row_driver_weights(breakdown: pd.DataFrame) -> np.ndarray:
-    weights = np.zeros((len(breakdown), len(DRIVER_COLUMNS)))
-    driver_names = list(DRIVER_COLUMNS)
-    for row_index, (_, row) in enumerate(breakdown.iterrows()):
-        mapped_drivers = COST_ELEMENT_DRIVER_MAP[row["cost_element"]]
-        sensitivity = (
-            sum(row[DRIVER_COLUMNS[driver]] for driver in mapped_drivers)
-            / len(mapped_drivers)
-        )
-        for driver in mapped_drivers:
-            weights[row_index, driver_names.index(driver)] = sensitivity / len(mapped_drivers)
-    return weights
 
 
 def explain_cost_increase(row: pd.Series) -> str:
@@ -807,7 +864,11 @@ with st.sidebar:
             key=f"{driver_name}_scenario",
             help=str(defaults["unit"]),
         )
-        change_percent = calculate_change_percent(current_price, scenario_price)
+        try:
+            change_percent = calculate_change_percent(current_price, scenario_price)
+        except ValueError:
+            st.error(f"{tr(driver_name)}: {tr('current_price_must_be_positive')}")
+            st.stop()
         st.caption(f"{defaults['unit']} | {tr('impact')} {change_percent:.2%}")
         price_scenarios[driver_name] = {
             "unit": defaults["unit"],
@@ -821,7 +882,7 @@ with st.sidebar:
     gp_target_percent = st.number_input(
         tr("target_gp"),
         min_value=0.0,
-        max_value=100.0,
+        max_value=60.0,
         value=float(selected_vehicle["target_gp_percent"]),
         step=0.5,
         key="selected_gp_target_percent",
@@ -929,7 +990,7 @@ with st.sidebar:
         all_supplier_map_df["vehicle_code"].eq(selected_vehicle_code)
     ].copy()
 
-    target_total_cost = selected_sales_price * (1 - gp_target_percent / 100)
+    target_total_cost = calculate_target_total_cost(selected_sales_price, gp_target_percent)
     current_total_cost = parts_df["total_base_cost"].sum()
     if current_total_cost > 0:
         normalization_scale = target_total_cost / current_total_cost
@@ -969,14 +1030,14 @@ with st.sidebar:
     )
     battery_share_percent = battery_budget / target_total_cost * 100 if target_total_cost else 0
     benchmark_warnings = []
-    if abs(battery_cost - battery_budget) > max(battery_budget * 0.05, 1):
+    if abs(battery_cost - battery_budget) > max(battery_budget * 0.25, 1):
         benchmark_warnings.append(
             tr("battery_budget_warning").format(
                 calculated=format_thb(battery_cost),
                 budget=format_thb(battery_budget),
             )
         )
-    if not 30 <= battery_share_percent <= 40:
+    if not 25 <= battery_share_percent <= 45:
         benchmark_warnings.append(
             tr("battery_share_warning").format(share=format_pct(battery_share_percent))
         )
@@ -1025,20 +1086,70 @@ if part_cost_mismatch:
 for warning in benchmark_warnings + cost_validation_warnings:
     st.warning(warning)
 
+battery_system_cost_before = parts_df.loc[
+    parts_df["module_name"].eq("Battery System"),
+    "total_base_cost",
+].sum()
+lithium_change_percent = driver_changes["Lithium Price"]
+lithium_exposure_of_battery = float(selected_vehicle["lithium_exposure_of_battery"])
+battery_lithium_impact = (
+    battery_system_cost_before
+    * lithium_exposure_of_battery
+    * lithium_change_percent
+)
+battery_system_cost_after_lithium = battery_system_cost_before + battery_lithium_impact
+
 breakdown_merge_keys = (
     ["vehicle_code", "part_code"]
     if "vehicle_code" in breakdown_df.columns and "vehicle_code" in parts_df.columns
     else ["part_code"]
 )
 breakdown_enriched = breakdown_df.merge(parts_df, on=breakdown_merge_keys, how="left")
-breakdown_enriched = calculate_element_impacts(breakdown_enriched, driver_changes)
+supplier_exposure_by_part = build_supplier_exposure_by_part(supplier_map_df, suppliers_df)
+breakdown_enriched = breakdown_enriched.merge(
+    supplier_exposure_by_part,
+    on="part_code",
+    how="left",
+)
+for supplier_factor_column in [
+    "supplier_oil_factor",
+    "supplier_fx_factor",
+    "supplier_shipping_factor",
+]:
+    breakdown_enriched[supplier_factor_column] = breakdown_enriched[
+        supplier_factor_column
+    ].fillna(0.0)
+
+# Driver impacts use explicit EV benchmark exposure rules. Lithium is handled as
+# a Battery System-only exposure to avoid double counting legacy lithium factors.
+breakdown_enriched = calculate_benchmark_element_impacts(
+    breakdown_enriched,
+    driver_changes,
+    lithium_exposure_of_battery,
+)
+battery_rows_mask = breakdown_enriched["module_name"].eq("Battery System")
+battery_cost_total_for_allocation = breakdown_enriched.loc[
+    battery_rows_mask,
+    "cost_amount",
+].sum()
+if battery_cost_total_for_allocation:
+    lithium_allocation = (
+        breakdown_enriched.loc[battery_rows_mask, "cost_amount"]
+        / battery_cost_total_for_allocation
+    )
+else:
+    lithium_allocation = pd.Series(dtype=float)
 
 traceability_frames = []
 has_driver_changes = any(abs(change) > 0.000001 for change in driver_changes.values())
 for trace_driver in DRIVER_COLUMNS:
     trace_changes = {name: 0.0 for name in DRIVER_COLUMNS}
     trace_changes[trace_driver] = driver_changes[trace_driver]
-    trace_frame = calculate_element_impacts(breakdown_enriched, trace_changes)
+    trace_frame = calculate_benchmark_element_impacts(
+        breakdown_enriched,
+        trace_changes,
+        lithium_exposure_of_battery,
+    )
     if has_driver_changes:
         trace_frame = trace_frame[trace_frame["element_impact"].abs() > 0].copy()
     else:
@@ -1077,8 +1188,143 @@ total_sales_price = results_df["sales_price"].sum()
 total_base_cost = results_df["old_cost"].sum()
 total_new_cost = results_df["new_cost"].sum()
 total_impact = total_new_cost - total_base_cost
-total_gp = total_sales_price - total_new_cost
-total_gp_percent = total_gp / total_sales_price * 100 if total_sales_price else 0
+base_gp_amount, base_gp_percent = calculate_vehicle_gp(total_sales_price, total_base_cost)
+total_gp, total_gp_percent = calculate_vehicle_gp(total_sales_price, total_new_cost)
+offset_result = calculate_offset_mitigation(
+    cost_breakdown=breakdown_enriched[["cost_element", "cost_amount"]],
+    reduction_percentages=offset_reductions,
+    commodity_cost_increase=float(total_impact),
+    base_total_cost=float(total_base_cost),
+    sales_price=float(total_sales_price),
+    target_gp_percent=float(gp_target_percent),
+)
+net_cost_impact = float(offset_result["net_impact"])
+total_cost_after_offset = float(offset_result["new_total_cost_after_offset"])
+gp_after_offset = float(offset_result["gp_after"])
+gp_after_offset_percent = float(offset_result["gp_after_percent"])
+
+if (
+    selected_vehicle_code == "BYD-SEAL-EV-TH"
+    and lithium_change_percent >= 0.5
+    and battery_lithium_impact < 30000
+):
+    st.warning(tr("lithium_impact_low_warning"))
+
+data_quality_records = []
+
+
+def add_data_quality_check(check_name: str, passed: bool, detail: str) -> None:
+    data_quality_records.append(
+        {
+            "Check": check_name,
+            "Status": tr("safe") if passed else tr("warning"),
+            "Detail": detail,
+        }
+    )
+
+
+add_data_quality_check(
+    "Vehicle total cost equals target total cost",
+    abs(total_base_cost - target_total_cost) <= 0.5,
+    f"{format_thb(total_base_cost)} vs {format_thb(target_total_cost)}",
+)
+module_totals = parts_df.groupby("module_name")["total_base_cost"].sum()
+add_data_quality_check(
+    "Vehicle total cost equals sum of module costs",
+    abs(module_totals.sum() - total_base_cost) <= 0.5,
+    format_thb(module_totals.sum()),
+)
+part_totals_from_breakdown = breakdown_df.groupby("part_code")["cost_amount"].sum()
+part_delta = part_totals_from_breakdown.sub(
+    parts_df.set_index("part_code")["total_base_cost"],
+    fill_value=0,
+).abs()
+add_data_quality_check(
+    "Part cost equals sum of cost breakdown",
+    bool((part_delta <= 0.5).all()),
+    f"{int((part_delta > 0.5).sum())} mismatches",
+)
+duplicate_part_count = int(parts_df.duplicated(["vehicle_code", "part_code"]).sum())
+add_data_quality_check(
+    "No duplicated part code within vehicle",
+    duplicate_part_count == 0,
+    f"{duplicate_part_count} duplicates",
+)
+add_data_quality_check(
+    "Sales price is positive",
+    selected_sales_price > 0,
+    format_thb(selected_sales_price),
+)
+add_data_quality_check(
+    "Target GP% is between 0 and 60",
+    0 <= gp_target_percent <= 60,
+    format_pct(gp_target_percent),
+)
+negative_cost_count = int((breakdown_df["cost_amount"] < 0).sum() + (parts_df["total_base_cost"] < 0).sum())
+add_data_quality_check(
+    "No negative base cost values",
+    negative_cost_count == 0,
+    f"{negative_cost_count} negative rows",
+)
+add_data_quality_check(
+    "Battery cost share is within EV benchmark range",
+    25 <= battery_share_percent <= 45,
+    format_pct(battery_share_percent),
+)
+oil_impact_total = float(breakdown_enriched["Oil Price impact"].sum())
+oil_logistics_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["cost_element"].eq("Logistics Cost")
+        | breakdown_enriched["module_name"].eq("Logistics / Import / Warehouse"),
+        "Oil Price impact",
+    ].sum()
+)
+oil_supplier_pass_through_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["cost_element"].eq("Purchased Parts Cost"),
+        "Oil Price impact",
+    ].sum()
+)
+oil_plastic_rubber_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["material_group"].astype(str).str.contains("Plastic|Rubber|Tire", case=False, na=False),
+        "Oil Price impact",
+    ].sum()
+)
+oil_energy_impact = float(
+    breakdown_enriched.loc[breakdown_enriched["cost_element"].eq("Energy Cost"), "Oil Price impact"].sum()
+)
+fx_imported_parts_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["cost_element"].isin(
+            ["Purchased Parts Cost", "Semiconductor Cost", "Software Cost", "Import Duty", "Logistics Cost"]
+        ),
+        "FX Rate impact",
+    ].sum()
+)
+steel_body_chassis_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["module_name"].eq("Body & Chassis")
+        | breakdown_enriched["part_name"].astype(str).str.contains("Steel|Chassis|Suspension|Brake", case=False, na=False),
+        "Steel Price impact",
+    ].sum()
+)
+copper_wiring_motor_impact = float(
+    breakdown_enriched.loc[
+        breakdown_enriched["part_name"].astype(str).str.contains("Wiring|Motor|Inverter|ECU|Electronics", case=False, na=False)
+        | breakdown_enriched["module_name"].eq("Electronics & Software"),
+        "Copper Price impact",
+    ].sum()
+)
+add_data_quality_check(
+    "Oil impact materiality check",
+    not (
+        selected_vehicle_code == "BYD-SEAL-EV-TH"
+        and driver_changes["Oil Price"] >= ((100 - 82) / 82)
+        and abs(oil_impact_total) < 5000
+    ),
+    format_thb(oil_impact_total),
+)
 
 supplier_merge_keys = (
     ["vehicle_code", "part_code"]
@@ -1168,20 +1414,16 @@ selected_breakdown["new_cost_amount"] = (
 )
 
 if dashboard_view == "executive":
-    base_gp = total_sales_price - total_base_cost
-    base_gp_percent = base_gp / total_sales_price * 100 if total_sales_price else 0
-    cost_change_percent = total_impact / total_base_cost * 100 if total_base_cost else 0
+    base_gp = base_gp_amount
+    cost_change_percent = net_cost_impact / total_base_cost * 100 if total_base_cost else 0
 
     executive_driver_rows = []
-    for driver_name, factor_column in DRIVER_COLUMNS.items():
+    for driver_name in DRIVER_COLUMNS:
+        impact = breakdown_enriched[f"{driver_name} impact"].sum()
         executive_driver_rows.append(
             {
                 "Driver": driver_name,
-                "Impact": (
-                    parts_df["total_base_cost"]
-                    * parts_df[factor_column]
-                    * driver_changes[driver_name]
-                ).sum(),
+                "Impact": impact,
                 "Change %": driver_changes[driver_name] * 100,
             }
         )
@@ -1205,9 +1447,11 @@ if dashboard_view == "executive":
         sampled_values = np.clip(sampled_values, config["min"], config["max"])
         quick_driver_changes.append((sampled_values - current_price) / current_price)
     quick_driver_matrix = np.column_stack(quick_driver_changes)
-    quick_row_weights = build_row_driver_weights(breakdown_enriched)
-    quick_row_change = quick_driver_matrix @ quick_row_weights.T
-    quick_cost_impact = quick_row_change * breakdown_enriched["cost_amount"].to_numpy()
+    quick_cost_impact = calculate_driver_impact_matrix(
+        breakdown_enriched,
+        quick_driver_matrix,
+        lithium_exposure_of_battery,
+    )
     quick_total_cost = total_base_cost + quick_cost_impact.sum(axis=1)
     quick_gp_percent = (total_sales_price - quick_total_cost) / total_sales_price * 100
     worst_case_gp_percent = float(np.percentile(quick_gp_percent, 5))
@@ -1217,27 +1461,47 @@ if dashboard_view == "executive":
         ascending=False,
     ).iloc[0]["risk_level"]
 
+    net_cost_impact_percent = net_cost_impact / total_base_cost * 100 if total_base_cost else 0
+    supplier_material_impact_percent = (
+        supplier_summary_df["supplier_total_impact"].abs().sum() / total_base_cost * 100
+        if total_base_cost
+        else 0
+    )
+
     if is_base_case:
         traffic_status = "safe"
         traffic_color = "#16a34a"
-    elif total_gp_percent < gp_target_percent or worst_case_gp_percent < gp_target_percent:
-        traffic_status = "critical"
-        traffic_color = "#dc2626"
-    elif total_gp_percent < gp_target_percent + 3 or abs(cost_change_percent) > 5:
-        traffic_status = "warning"
-        traffic_color = "#ca8a04"
     else:
-        traffic_status = "safe"
-        traffic_color = "#16a34a"
-    status_icon = {"safe": "&#10003;", "warning": "!", "critical": "&#10005;"}[traffic_status]
+        traffic_status = classify_financial_risk(
+            gp_after_percent=gp_after_offset_percent,
+            target_gp_percent=gp_target_percent,
+            net_cost_impact=net_cost_impact,
+            base_total_cost=total_base_cost,
+            worst_case_gp_percent=worst_case_gp_percent,
+            material_supplier_impact_percent=supplier_material_impact_percent,
+        )
+        traffic_color = {
+            "safe": "#16a34a",
+            "warning": "#ca8a04",
+            "high": "#f97316",
+            "critical": "#dc2626",
+        }[traffic_status]
+    status_icon = {
+        "safe": "&#10003;",
+        "warning": "!",
+        "high": "&#9650;",
+        "critical": "&#10005;",
+    }[traffic_status]
     status_copy = {
         "safe": tr("status_safe_message"),
         "warning": tr("status_warning_message"),
+        "high": tr("status_high_message"),
         "critical": tr("status_critical_message"),
     }[traffic_status]
     status_gradient = {
         "safe": "linear-gradient(135deg, #047857 0%, #16a34a 100%)",
         "warning": "linear-gradient(135deg, #a16207 0%, #eab308 100%)",
+        "high": "linear-gradient(135deg, #c2410c 0%, #f97316 100%)",
         "critical": "linear-gradient(135deg, #991b1b 0%, #dc2626 100%)",
     }[traffic_status]
 
@@ -1268,6 +1532,14 @@ if dashboard_view == "executive":
                 after=format_pct(total_gp_percent),
             )
         )
+        if abs(lithium_change_percent) > 0:
+            executive_summary += (
+                "\n\n"
+                + tr("lithium_executive_explanation").format(
+                    change=format_pct(lithium_change_percent * 100),
+                    impact=format_thb(battery_lithium_impact),
+                )
+            )
 
     history_for_exec = load_scenario_history()
     if history_for_exec.empty:
@@ -1322,13 +1594,13 @@ if dashboard_view == "executive":
         """
     )
 
-    cost_trend = "&#8593;" if total_impact > 0 else "&#8595;" if total_impact < 0 else "&#8594;"
-    gp_trend = "&#8593;" if total_gp_percent >= base_gp_percent else "&#8595;"
+    cost_trend = "&#8593;" if net_cost_impact > 0 else "&#8595;" if net_cost_impact < 0 else "&#8594;"
+    gp_trend = "&#8593;" if gp_after_offset_percent >= base_gp_percent else "&#8595;"
     risk_trend = "&#9679;"
     supplier_trend = "&#9650;" if supplier_summary_df["supplier_total_impact"].abs().sum() > 0 else "&#8594;"
     worst_case_trend = "&#8593;" if worst_case_gp_percent >= gp_target_percent else "&#8595;"
-    net_color = "#dc2626" if total_impact > 0 else "#16a34a" if total_impact < 0 else "#64748b"
-    gp_color = "#16a34a" if total_gp_percent >= gp_target_percent else "#dc2626"
+    net_color = "#dc2626" if net_cost_impact > 0 else "#16a34a" if net_cost_impact < 0 else "#64748b"
+    gp_color = "#16a34a" if gp_after_offset_percent >= gp_target_percent else "#dc2626"
     risk_color = traffic_color
 
     kpi_cards = [
@@ -1342,31 +1614,31 @@ if dashboard_view == "executive":
         ),
         render_exec_kpi(
             tr("total_vehicle_cost"),
-            format_thb(total_new_cost),
-            tr("cost_delta").format(delta=format_thb(total_impact)),
+            format_thb(total_cost_after_offset),
+            tr("cost_delta").format(delta=format_thb(net_cost_impact)),
             "&#3647;",
             net_color,
             cost_trend,
         ),
         render_exec_kpi(
             tr("gross_profit"),
-            format_thb(total_gp),
-            tr("gp_delta").format(delta=format_pct(total_gp_percent - base_gp_percent)),
+            format_thb(gp_after_offset),
+            tr("gp_delta").format(delta=format_pct(gp_after_offset_percent - base_gp_percent)),
             "GP",
             gp_color,
             gp_trend,
         ),
         render_exec_kpi(
             tr("gp_percent"),
-            format_pct(total_gp_percent),
-            tr("gp_delta").format(delta=format_pct(total_gp_percent - base_gp_percent)),
+            format_pct(gp_after_offset_percent),
+            tr("gp_delta").format(delta=format_pct(gp_after_offset_percent - base_gp_percent)),
             "%",
             gp_color,
             gp_trend,
         ),
         render_exec_kpi(
             tr("net_cost_impact"),
-            format_thb(total_impact),
+            format_thb(net_cost_impact),
             tr("cost_change_percent").format(delta=format_pct(cost_change_percent)),
             "&#916;",
             net_color,
@@ -1417,7 +1689,7 @@ if dashboard_view == "executive":
         summary_bullets = [
             tr("base_case_no_market_impact"),
             tr("current_gp_vs_target").format(
-                gp=format_pct(total_gp_percent),
+                gp=format_pct(gp_after_offset_percent),
                 target=format_pct(gp_target_percent),
             ),
             tr("no_offset_required"),
@@ -1430,7 +1702,7 @@ if dashboard_view == "executive":
             ),
             tr(gp_sentence_key).format(
                 before=format_pct(base_gp_percent),
-                after=format_pct(total_gp_percent),
+                after=format_pct(gp_after_offset_percent),
             ),
             tr("primary_module_part_summary").format(
                 module=top_module_name,
@@ -1524,20 +1796,6 @@ if dashboard_view == "executive":
         )
 
     with chart_cols[1]:
-        risk_score_value = {"safe": 20.0, "warning": 62.0, "critical": 92.0}[traffic_status]
-        st.plotly_chart(
-            build_gauge_chart(
-                tr("risk_gauge"),
-                risk_score_value,
-                60.0,
-                100.0,
-                risk_color,
-            ),
-            use_container_width=True,
-        )
-
-    chart_cols = st.columns(2)
-    with chart_cols[0]:
         waterfall_fig = go.Figure(
             go.Waterfall(
                 name=tr("cost_impact_waterfall"),
@@ -1562,58 +1820,335 @@ if dashboard_view == "executive":
         )
         st.plotly_chart(waterfall_fig, use_container_width=True)
 
-    with chart_cols[1]:
-        if history_for_exec.empty:
-            st.info(tr("no_scenarios_to_compare"))
-        else:
-            scenario_fig = go.Figure()
-            scenario_fig.add_bar(
-                x=scenario_compare_df["scenario_name"],
-                y=scenario_compare_df["total_vehicle_cost"],
-                name=tr("total_vehicle_cost"),
-                marker_color="#8f1118",
-            )
-            scenario_fig.add_scatter(
-                x=scenario_compare_df["scenario_name"],
-                y=scenario_compare_df["gp_percent"],
-                name=tr("gp_percent"),
-                yaxis="y2",
-                mode="lines+markers",
-                line={"color": "#0f766e", "width": 3},
-            )
-            scenario_fig.update_layout(
-                title=tr("scenario_compare"),
-                height=360,
-                margin={"l": 20, "r": 20, "t": 54, "b": 70},
-                paper_bgcolor="white",
-                plot_bgcolor="white",
-                font={"family": "Arial", "color": "#0f172a"},
-                yaxis={"title": "THB"},
-                yaxis2={
-                    "title": tr("gp_percent"),
-                    "overlaying": "y",
-                    "side": "right",
-                    "ticksuffix": "%",
-                },
-                legend={"orientation": "h", "y": -0.24},
-            )
-            st.plotly_chart(scenario_fig, use_container_width=True)
+    st.stop()
 
-    if not scenario_compare_df.empty:
-        st.subheader(tr("scenario_compare"))
+if dashboard_view == "scenario_compare_page":
+    st.subheader(tr("scenario_compare"))
+    offset_result = calculate_offset_mitigation(
+        cost_breakdown=breakdown_enriched[["cost_element", "cost_amount"]],
+        reduction_percentages=offset_reductions,
+        commodity_cost_increase=float(total_impact),
+        base_total_cost=float(total_base_cost),
+        sales_price=float(total_sales_price),
+        target_gp_percent=float(gp_target_percent),
+    )
+    scenario_cols = st.columns(4, gap="large")
+    scenario_cols[0].metric(tr("net_cost_impact"), format_thb(total_impact))
+    scenario_cols[1].metric(tr("gross_profit"), format_thb(total_gp))
+    scenario_cols[2].metric(tr("gp_percent"), format_pct(total_gp_percent))
+    scenario_cols[3].metric(tr("offset_savings"), format_thb(offset_result["offset_savings"]))
+
+    with st.expander(tr("cost_offset_mitigation"), expanded=True):
+        offset_detail_df = pd.DataFrame(offset_result["offset_rows"])
+        offset_detail_df["reduction_percent"] = offset_detail_df["reduction_percent"] * 100
+        offset_detail_with_total = add_total_row(
+            offset_detail_df,
+            label_column="category",
+            sum_columns=["category_cost", "savings"],
+            weighted_average_columns=["reduction_percent"],
+            weight_column="category_cost",
+        )
         st.dataframe(
-            scenario_compare_df[
-                ["saved_at", "scenario_name", "total_vehicle_cost", "gp_amount", "gp_percent"]
-            ],
+            style_total_row(offset_detail_with_total),
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "total_vehicle_cost": st.column_config.NumberColumn(format="THB %.0f"),
-                "gp_amount": st.column_config.NumberColumn(format="THB %.0f"),
-                "gp_percent": st.column_config.NumberColumn(format="%.2f%%"),
-            },
         )
 
+    scenario_row = {
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scenario_name": scenario_name.strip(),
+        "vehicle_code": selected_vehicle_code,
+        "vehicle_name": selected_vehicle["vehicle_name"],
+        "sales_price": round(float(selected_sales_price), 2),
+        "total_vehicle_cost": round(float(total_new_cost), 2),
+        "gp_amount": round(float(total_gp), 2),
+        "gp_percent": round(float(total_gp_percent), 4),
+        "selected_supplier": selected_supplier,
+        "gp_target_percent": round(float(gp_target_percent), 4),
+        "selected_module": selected_module,
+        "selected_part": selected_part_name,
+        "offset_savings": round(float(offset_result["offset_savings"]), 2),
+        "offset_net_impact": round(float(offset_result["net_impact"]), 2),
+    }
+    for driver_name, scenario in price_scenarios.items():
+        scenario_row[f"{driver_name} current"] = scenario["current_price"]
+        scenario_row[f"{driver_name} scenario"] = scenario["scenario_price"]
+        scenario_row[f"{driver_name} change %"] = round(float(scenario["change_percent"] * 100), 4)
+
+    action_cols = st.columns([1, 3])
+    with action_cols[0]:
+        if st.button(tr("save_scenario"), use_container_width=True):
+            if not scenario_row["scenario_name"]:
+                st.error(tr("scenario_name_required"))
+            else:
+                save_scenario(scenario_row)
+                st.success(f"{tr('scenario_saved')}: {scenario_row['scenario_name']}")
+
+    scenario_history_df = load_scenario_history()
+    if scenario_history_df.empty:
+        st.info(tr("scenario_empty"))
+    else:
+        scenario_history_display = add_total_row(
+            scenario_history_df.sort_values("saved_at", ascending=False),
+            label_column="scenario_name",
+            sum_columns=["sales_price", "total_vehicle_cost", "gp_amount"],
+            gp_percent_column="gp_percent",
+        )
+        st.dataframe(style_total_row(scenario_history_display), use_container_width=True, hide_index=True)
+        with st.expander(tr("scenario_comparison_chart"), expanded=True):
+            labels = (
+                scenario_history_df["saved_at"].astype(str)
+                + " | "
+                + scenario_history_df["scenario_name"].astype(str)
+            )
+            scenario_history_df = scenario_history_df.assign(scenario_label=labels)
+            compare_cols = st.columns(2)
+            first_label = compare_cols[0].selectbox(tr("compare_scenario_a"), labels.tolist())
+            second_label = compare_cols[1].selectbox(
+                tr("compare_scenario_b"),
+                labels.tolist(),
+                index=min(1, len(labels) - 1),
+            )
+            selected_compare = scenario_history_df[
+                scenario_history_df["scenario_label"].isin([first_label, second_label])
+            ]
+            st.bar_chart(
+                selected_compare.set_index("scenario_label")[
+                    ["total_vehicle_cost", "gp_amount", "gp_percent"]
+                ]
+            )
+        st.download_button(
+            tr("export_excel"),
+            data=scenario_history_to_excel(scenario_history_df.drop(columns=["scenario_label"], errors="ignore")),
+            file_name="scenario_history.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    st.stop()
+
+if dashboard_view == "supplier_risk_page":
+    st.subheader(tr("supplier_risk_dashboard"))
+    supplier_total_impact = supplier_summary_df["supplier_total_impact"].sum()
+    supplier_cols = st.columns(4, gap="large")
+    supplier_cols[0].metric(tr("active_suppliers"), f"{supplier_summary_df['supplier_name'].nunique():,}")
+    supplier_cols[1].metric(tr("supplier_cost_base"), format_thb(supplier_summary_df["supplier_cost_base"].sum()))
+    supplier_cols[2].metric(tr("supplier_scenario_impact"), format_thb(supplier_total_impact))
+    supplier_cols[3].metric(tr("disruption_impact"), format_thb(supplier_summary_df["supplier_disruption_impact"].sum()))
+
+    supplier_impact_table = add_total_row(
+        supplier_summary_df.sort_values("supplier_total_impact", key=lambda values: values.abs(), ascending=False),
+        label_column="supplier_name",
+        sum_columns=[
+            "supplied_parts",
+            "supplier_cost_base",
+            "supplier_price_impact",
+            "supplier_delay_impact",
+            "supplier_disruption_impact",
+            "supplier_fx_impact",
+            "supplier_total_impact",
+            "vehicle_cost_contribution %",
+            "risk_exposure",
+        ],
+        weighted_average_columns=["risk_score"],
+        weight_column="supplier_cost_base",
+    )
+    st.dataframe(style_total_row(localize_dataframe(supplier_impact_table)), use_container_width=True, hide_index=True)
+    with st.expander(tr("part_to_supplier_traceability"), expanded=False):
+        st.dataframe(
+            localize_dataframe(supplier_detail_df.sort_values("supplier_total_impact", key=lambda values: values.abs(), ascending=False)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.stop()
+
+if dashboard_view == "monte_carlo_page":
+    st.subheader(tr("monte_carlo_simulation"))
+    rng = np.random.default_rng(42)
+    driver_names = list(DRIVER_COLUMNS)
+    sampled_driver_changes = []
+    for driver_name in driver_names:
+        config = monte_carlo_config[driver_name]
+        current_price = price_scenarios[driver_name]["current_price"]
+        sampled_values = rng.normal(loc=config["mean"], scale=config["volatility"], size=MONTE_CARLO_RUNS)
+        sampled_values = np.clip(sampled_values, config["min"], config["max"])
+        sampled_driver_changes.append((sampled_values - current_price) / current_price)
+    driver_change_matrix = np.column_stack(sampled_driver_changes)
+    simulation_cost_impact = calculate_driver_impact_matrix(
+        breakdown_enriched,
+        driver_change_matrix,
+        lithium_exposure_of_battery,
+    )
+    total_cost_distribution = total_base_cost + simulation_cost_impact.sum(axis=1)
+    gp_distribution = total_sales_price - total_cost_distribution
+    gp_percent_distribution = gp_distribution / total_sales_price * 100
+    gp_below_target_probability = float((gp_percent_distribution < gp_target_percent).mean() * 100)
+    mc_cols = st.columns(4, gap="large")
+    mc_cols[0].metric(tr("simulations"), f"{MONTE_CARLO_RUNS:,}")
+    mc_cols[1].metric(tr("probability_gp_below_target"), format_pct(gp_below_target_probability))
+    mc_cols[2].metric(tr("average_gp_percent"), format_pct(float(gp_percent_distribution.mean())))
+    mc_cols[3].metric(tr("value_at_risk"), format_thb(float(np.percentile(gp_distribution, 5))))
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        hist_counts, hist_bins = np.histogram(total_cost_distribution, bins=40)
+        st.subheader(tr("histogram_total_vehicle_cost"))
+        st.bar_chart(pd.DataFrame({"Cost": hist_bins[:-1], "Frequency": hist_counts}).set_index("Cost"))
+    with chart_cols[1]:
+        probability_df = pd.DataFrame(
+            {
+                "Outcome": ["GP% below target", "GP% at or above target"],
+                "Probability": [gp_below_target_probability, 100 - gp_below_target_probability],
+            }
+        ).set_index("Outcome")
+        st.subheader(tr("probability_chart"))
+        st.bar_chart(probability_df)
+    with st.expander(tr("monte_carlo_simulation"), expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "total_vehicle_cost": total_cost_distribution[:1000],
+                    "gp_amount": gp_distribution[:1000],
+                    "gp_percent": gp_percent_distribution[:1000],
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.stop()
+
+if dashboard_view == "data_quality_page":
+    st.subheader(tr("data_quality"))
+    st.info(f"{len(benchmark_warnings + cost_validation_warnings)} {tr('risk_analysis')}")
+    st.subheader(tr("data_quality_checks"))
+    st.dataframe(pd.DataFrame(data_quality_records), use_container_width=True, hide_index=True)
+    with st.expander(tr("calculation_assumptions"), expanded=False):
+        st.markdown(
+            dedent(
+                f"""
+                - {tr("assumption_vehicle_cost")}
+                - {tr("assumption_driver_prices")}
+                - {tr("assumption_lithium")}
+                - {tr("assumption_offsets")}
+                - {tr("assumption_risk")}
+                """
+            )
+        )
+    driver_impact_rows = []
+    for driver_name in DRIVER_COLUMNS:
+        driver_impact_column = f"{driver_name} impact"
+        affected_breakdown = breakdown_enriched[breakdown_enriched[driver_impact_column].abs() > 0]
+        affected = parts_df[parts_df["part_code"].isin(affected_breakdown["part_code"].unique())]
+        estimated_cost_impact = breakdown_enriched[driver_impact_column].sum()
+        driver_impact_rows.append(
+            {
+                tr("Driver"): tr(driver_name),
+                tr("current"): price_scenarios[driver_name]["current_price"],
+                tr("scenario"): price_scenarios[driver_name]["scenario_price"],
+                "Calculated impact %": driver_changes[driver_name] * 100,
+                "Estimated cost impact": estimated_cost_impact,
+                "Affected modules": ", ".join(sorted(affected["module_name"].unique().tolist())),
+                "Affected parts": ", ".join(affected["part_name"].head(6).tolist()),
+            }
+        )
+    driver_impact_df = pd.DataFrame(driver_impact_rows).sort_values("Estimated cost impact", key=lambda values: values.abs(), ascending=False)
+    driver_impact_display = add_total_row(driver_impact_df, label_column=tr("Driver"), sum_columns=["Estimated cost impact"])
+    st.subheader(tr("commodity_scenario_exposure"))
+    st.dataframe(style_total_row(driver_impact_display), use_container_width=True, hide_index=True)
+    with st.expander(tr("root_cause_trace_table"), expanded=False):
+        st.dataframe(localize_dataframe(traceability_df.head(100)), use_container_width=True, hide_index=True)
+    st.stop()
+
+if dashboard_view == "cost_structure":
+    kpi_top_cols = st.columns(3, gap="large")
+    kpi_top_cols[0].metric(tr("vehicle_sales_price"), format_thb(total_sales_price))
+    kpi_top_cols[1].metric(tr("base_cost"), format_thb(total_base_cost))
+    kpi_top_cols[2].metric(tr("simulated_cost"), format_thb(total_new_cost), format_thb(total_impact))
+    kpi_bottom_cols = st.columns(2, gap="large")
+    kpi_bottom_cols[0].metric(tr("gross_profit"), format_thb(total_gp))
+    kpi_bottom_cols[1].metric(tr("gp_percent"), format_pct(total_gp_percent))
+
+    st.subheader(tr("lithium_battery_impact"))
+    lithium_cols = st.columns(4, gap="large")
+    lithium_cols[0].metric(tr("lithium_impact_on_battery_system"), format_thb(battery_lithium_impact))
+    lithium_cols[1].metric(tr("battery_system_cost_before"), format_thb(battery_system_cost_before))
+    lithium_cols[2].metric(tr("battery_system_cost_after"), format_thb(battery_system_cost_after_lithium))
+    lithium_cols[3].metric(tr("lithium_exposure_percent"), format_pct(lithium_exposure_of_battery * 100))
+
+    st.subheader(tr("driver_impact_breakdown"))
+    impact_cols = st.columns(4, gap="large")
+    impact_cols[0].metric(tr("gross_driver_impact"), format_thb(total_impact))
+    impact_cols[1].metric(tr("offset_savings"), format_thb(offset_result["offset_savings"]))
+    impact_cols[2].metric(tr("net_cost_impact"), format_thb(net_cost_impact))
+    impact_cols[3].metric(tr("gp_after"), format_thb(gp_after_offset), format_pct(gp_after_offset_percent))
+    detail_cols = st.columns(3, gap="large")
+    detail_cols[0].metric(tr("oil_impact_on_logistics"), format_thb(oil_logistics_impact))
+    detail_cols[1].metric(tr("oil_impact_on_supplier_pass_through"), format_thb(oil_supplier_pass_through_impact))
+    detail_cols[2].metric(tr("oil_impact_on_plastic_rubber"), format_thb(oil_plastic_rubber_impact))
+    detail_cols = st.columns(4, gap="large")
+    detail_cols[0].metric(tr("oil_impact_on_energy"), format_thb(oil_energy_impact))
+    detail_cols[1].metric(tr("fx_impact_on_imported_parts"), format_thb(fx_imported_parts_impact))
+    detail_cols[2].metric(tr("steel_impact_on_body_chassis"), format_thb(steel_body_chassis_impact))
+    detail_cols[3].metric(tr("copper_impact_on_wiring_motor"), format_thb(copper_wiring_motor_impact))
+
+    module_summary = (
+        results_df.groupby("module_name", as_index=False)
+        .agg(
+            components=("part_code", "count"),
+            sales_price=("sales_price", "sum"),
+            old_cost=("old_cost", "sum"),
+            new_cost=("new_cost", "sum"),
+            impact_amount=("impact_amount", "sum"),
+            gp_amount=("gp_amount", "sum"),
+            risk_exposure=("risk_exposure", "sum"),
+        )
+        .sort_values("new_cost", ascending=False)
+    )
+    module_summary["gp_percent"] = module_summary["gp_amount"] / module_summary["sales_price"] * 100
+    module_summary_display = add_total_row(
+        module_summary,
+        label_column="module_name",
+        sum_columns=["components", "sales_price", "old_cost", "new_cost", "impact_amount", "gp_amount", "risk_exposure"],
+        gp_percent_column="gp_percent",
+    )
+    st.subheader(tr("module_level_summary"))
+    st.dataframe(style_total_row(localize_dataframe(module_summary_display)), use_container_width=True, hide_index=True)
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        st.subheader(tr("cost_by_module"))
+        st.bar_chart(module_summary.set_index("module_name")[["old_cost", "new_cost"]])
+    with chart_cols[1]:
+        st.subheader(tr("top_impacted_components"))
+        st.bar_chart(results_df.reindex(results_df["impact_amount"].abs().sort_values(ascending=False).index).head(10).set_index("part_name")["impact_amount"])
+
+    st.subheader(tr("hierarchical_bom_tree"))
+    for module_name, module_df in results_df.groupby("module_name", sort=True):
+        with st.expander(
+            f"{tr(module_name)} | {len(module_df)} {tr('component')} | {format_thb(module_df['new_cost'].sum())}",
+            expanded=module_name == selected_part["module_name"],
+        ):
+            st.dataframe(localize_dataframe(module_df), use_container_width=True, hide_index=True)
+
+    with st.expander(tr("part_level_summary"), expanded=False):
+        part_table = filtered_df[
+            ["part_code", "part_name", "module_name", "material_group", "sales_price", "old_cost", "new_cost", "impact_amount", "gp_amount", "gp_percent", "risk_score", "risk_exposure", "risk_band"]
+        ].copy()
+        part_table_display = add_total_row(
+            part_table,
+            label_column="part_name",
+            sum_columns=["sales_price", "old_cost", "new_cost", "impact_amount", "gp_amount", "risk_exposure"],
+            weighted_average_columns=["risk_score"],
+            weight_column="old_cost",
+            gp_percent_column="gp_percent",
+        )
+        st.dataframe(style_total_row(localize_dataframe(part_table_display)), use_container_width=True, hide_index=True)
+
+    with st.expander(tr("selected_component_cost_breakdown"), expanded=False):
+        breakdown_table = selected_breakdown[["cost_element", "cost_amount", "element_impact", "new_cost_amount"]].copy()
+        breakdown_table_display = add_total_row(
+            breakdown_table,
+            label_column="cost_element",
+            sum_columns=["cost_amount", "element_impact", "new_cost_amount"],
+        )
+        st.dataframe(style_total_row(localize_dataframe(breakdown_table_display)), use_container_width=True, hide_index=True)
     st.stop()
 
 kpi_top_cols = st.columns(3, gap="large")
@@ -1625,11 +2160,30 @@ kpi_bottom_cols = st.columns(2, gap="large")
 kpi_bottom_cols[0].metric(tr("gross_profit"), format_thb(total_gp))
 kpi_bottom_cols[1].metric(tr("gp_percent"), format_pct(total_gp_percent))
 
+st.subheader(tr("lithium_battery_impact"))
+lithium_cols = st.columns(4, gap="large")
+lithium_cols[0].metric(
+    tr("lithium_impact_on_battery_system"),
+    format_thb(battery_lithium_impact),
+)
+lithium_cols[1].metric(
+    tr("battery_system_cost_before"),
+    format_thb(battery_system_cost_before),
+)
+lithium_cols[2].metric(
+    tr("battery_system_cost_after"),
+    format_thb(battery_system_cost_after_lithium),
+)
+lithium_cols[3].metric(
+    tr("lithium_exposure_percent"),
+    format_pct(lithium_exposure_of_battery * 100),
+)
+
 st.subheader(tr("cost_offset_mitigation"))
 offset_result = calculate_offset_mitigation(
     cost_breakdown=breakdown_enriched[["cost_element", "cost_amount"]],
     reduction_percentages=offset_reductions,
-    commodity_cost_increase=max(float(total_impact), 0.0),
+    commodity_cost_increase=float(total_impact),
     base_total_cost=float(total_base_cost),
     sales_price=float(total_sales_price),
     target_gp_percent=float(gp_target_percent),
@@ -1705,8 +2259,15 @@ with offset_chart_cols[2]:
     st.bar_chart(gp_before_after_df)
 
 with st.expander(tr("cost_offset_mitigation"), expanded=False):
-    st.dataframe(
+    offset_detail_with_total = add_total_row(
         offset_detail_df,
+        label_column="category",
+        sum_columns=["category_cost", "savings"],
+        weighted_average_columns=["reduction_percent"],
+        weight_column="category_cost",
+    )
+    st.dataframe(
+        style_total_row(offset_detail_with_total),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -1772,11 +2333,18 @@ scenario_history_df = load_scenario_history()
 if scenario_history_df.empty:
     st.info(tr("scenario_empty"))
 else:
-    st.dataframe(
+    scenario_history_display = add_total_row(
         scenario_history_df.sort_values("saved_at", ascending=False),
+        label_column="scenario_name",
+        sum_columns=["sales_price", "total_vehicle_cost", "gp_amount"],
+        gp_percent_column="gp_percent",
+    )
+    st.dataframe(
+        style_total_row(scenario_history_display),
         use_container_width=True,
         hide_index=True,
         column_config={
+            "sales_price": st.column_config.NumberColumn(format="THB %.0f"),
             "total_vehicle_cost": st.column_config.NumberColumn(format="THB %.0f"),
             "gp_amount": st.column_config.NumberColumn(format="THB %.0f"),
             "gp_percent": st.column_config.NumberColumn(format="%.2f%%"),
@@ -1912,12 +2480,29 @@ with supplier_panel_cols[2]:
     )
 
 st.subheader(tr("supplier_level_cost_impact_analysis"))
-st.dataframe(
-    localize_dataframe(supplier_summary_df.sort_values(
+supplier_impact_table = add_total_row(
+    supplier_summary_df.sort_values(
         "supplier_total_impact",
         key=lambda values: values.abs(),
         ascending=False,
-    )),
+    ),
+    label_column="supplier_name",
+    sum_columns=[
+        "supplied_parts",
+        "supplier_cost_base",
+        "supplier_price_impact",
+        "supplier_delay_impact",
+        "supplier_disruption_impact",
+        "supplier_fx_impact",
+        "supplier_total_impact",
+        "vehicle_cost_contribution %",
+        "risk_exposure",
+    ],
+    weighted_average_columns=["risk_score"],
+    weight_column="supplier_cost_base",
+)
+st.dataframe(
+    style_total_row(localize_dataframe(supplier_impact_table)),
     use_container_width=True,
     hide_index=True,
     column_config={
@@ -1968,12 +2553,15 @@ with st.expander(tr("part_to_supplier_traceability"), expanded=False):
 
 st.subheader(tr("commodity_scenario_exposure"))
 driver_impact_rows = []
-for driver_name, factor_column in DRIVER_COLUMNS.items():
-    affected = parts_df[parts_df[factor_column] > 0]
+for driver_name in DRIVER_COLUMNS:
+    driver_impact_column = f"{driver_name} impact"
+    affected_breakdown = breakdown_enriched[breakdown_enriched[driver_impact_column].abs() > 0]
+    affected = parts_df[parts_df["part_code"].isin(affected_breakdown["part_code"].unique())]
     affected_modules = ", ".join(sorted(affected["module_name"].unique().tolist()))
     affected_parts = ", ".join(affected["part_name"].head(6).tolist())
     if len(affected) > 6:
         affected_parts = f"{affected_parts} +{len(affected) - 6} more"
+    estimated_cost_impact = breakdown_enriched[driver_impact_column].sum()
     driver_impact_rows.append(
         {
             tr("Driver"): tr(driver_name),
@@ -1981,11 +2569,7 @@ for driver_name, factor_column in DRIVER_COLUMNS.items():
             tr("scenario"): price_scenarios[driver_name]["scenario_price"],
             "Unit": price_scenarios[driver_name]["unit"],
             "Calculated impact %": driver_changes[driver_name] * 100,
-            "Estimated cost impact": (
-                parts_df["total_base_cost"]
-                * parts_df[factor_column]
-                * driver_changes[driver_name]
-            ).sum(),
+            "Estimated cost impact": estimated_cost_impact,
             "Affected modules": affected_modules,
             "Affected parts": affected_parts,
         }
@@ -1995,8 +2579,17 @@ driver_impact_df = pd.DataFrame(driver_impact_rows).sort_values(
     key=lambda values: values.abs(),
     ascending=False,
 )
-st.dataframe(
+driver_impact_display = add_total_row(
     driver_impact_df,
+    label_column=tr("Driver"),
+    sum_columns=["Estimated cost impact"],
+)
+driver_impact_display.loc[
+    driver_impact_display.index[-1],
+    "Calculated impact %",
+] = (total_impact / total_base_cost * 100 if total_base_cost else 0)
+st.dataframe(
+    style_total_row(driver_impact_display),
     use_container_width=True,
     hide_index=True,
     column_config={
@@ -2245,7 +2838,11 @@ sensitivity_part_frames = []
 for driver_name in DRIVER_COLUMNS:
     isolated_changes = {name: 0.0 for name in DRIVER_COLUMNS}
     isolated_changes[driver_name] = driver_changes[driver_name]
-    driver_breakdown = calculate_element_impacts(breakdown_enriched, isolated_changes)
+    driver_breakdown = calculate_benchmark_element_impacts(
+        breakdown_enriched,
+        isolated_changes,
+        lithium_exposure_of_battery,
+    )
     driver_parts = (
         driver_breakdown.groupby(
             ["part_code", "part_name", "module_name"],
@@ -2372,10 +2969,11 @@ for driver_name in driver_names:
     sampled_driver_changes.append((sampled_values - current_price) / current_price)
 
 driver_change_matrix = np.column_stack(sampled_driver_changes)
-row_driver_weights = build_row_driver_weights(breakdown_enriched)
-row_change_matrix = driver_change_matrix @ row_driver_weights.T
-base_cost_vector = breakdown_enriched["cost_amount"].to_numpy()
-simulation_cost_impact = row_change_matrix * base_cost_vector
+simulation_cost_impact = calculate_driver_impact_matrix(
+    breakdown_enriched,
+    driver_change_matrix,
+    lithium_exposure_of_battery,
+)
 total_cost_distribution = total_base_cost + simulation_cost_impact.sum(axis=1)
 gp_distribution = total_sales_price - total_cost_distribution
 gp_percent_distribution = gp_distribution / total_sales_price * 100
@@ -2477,12 +3075,12 @@ module_names = list(module_index.cat.categories)
 module_codes = module_index.cat.codes.to_numpy()
 module_impacts = pd.DataFrame(index=driver_names, columns=module_names, dtype=float)
 for driver_position, driver_name in enumerate(driver_names):
-    driver_only_change = driver_change_matrix[:, driver_position]
-    driver_row_weights = row_driver_weights[:, driver_position]
-    driver_row_impact = (
-        driver_only_change[:, None]
-        * driver_row_weights[None, :]
-        * base_cost_vector[None, :]
+    driver_only_matrix = np.zeros_like(driver_change_matrix)
+    driver_only_matrix[:, driver_position] = driver_change_matrix[:, driver_position]
+    driver_row_impact = calculate_driver_impact_matrix(
+        breakdown_enriched,
+        driver_only_matrix,
+        lithium_exposure_of_battery,
     )
     for module_position, module_name in enumerate(module_names):
         module_mask = module_codes == module_position
@@ -2527,7 +3125,28 @@ module_summary = (
 module_summary["gp_percent"] = module_summary["gp_amount"] / module_summary["sales_price"] * 100
 
 st.subheader(tr("module_level_summary"))
-st.dataframe(localize_dataframe(module_summary), use_container_width=True, hide_index=True)
+module_summary_display = add_total_row(
+    module_summary,
+    label_column="module_name",
+    sum_columns=[
+        "components",
+        "sales_price",
+        "old_cost",
+        "new_cost",
+        "impact_amount",
+        "gp_amount",
+        "risk_exposure",
+    ],
+    gp_percent_column="gp_percent",
+)
+st.dataframe(
+    style_total_row(localize_dataframe(module_summary_display)),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "gp_percent": st.column_config.NumberColumn(format="%.2f%%"),
+    },
+)
 
 st.subheader(tr("hierarchical_bom_tree"))
 for module_name, module_df in results_df.groupby("module_name", sort=True):
@@ -2616,8 +3235,29 @@ part_table = filtered_df[
         "risk_band",
     ]
 ].copy()
-part_table["gp_percent"] = part_table["gp_percent"].map(format_pct)
-st.dataframe(localize_dataframe(part_table), use_container_width=True, hide_index=True)
+part_table_display = add_total_row(
+    part_table,
+    label_column="part_name",
+    sum_columns=[
+        "sales_price",
+        "old_cost",
+        "new_cost",
+        "impact_amount",
+        "gp_amount",
+        "risk_exposure",
+    ],
+    weighted_average_columns=["risk_score"],
+    weight_column="old_cost",
+    gp_percent_column="gp_percent",
+)
+st.dataframe(
+    style_total_row(localize_dataframe(part_table_display)),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "gp_percent": st.column_config.NumberColumn(format="%.2f%%"),
+    },
+)
 
 st.subheader(tr("selected_component_breakdown"))
 selected_top_cols = st.columns(3, gap="large")
@@ -2634,7 +3274,16 @@ with breakdown_cols[0]:
     breakdown_table = selected_breakdown[
         ["cost_element", "cost_amount", "element_impact", "new_cost_amount"]
     ].copy()
-    st.dataframe(localize_dataframe(breakdown_table), use_container_width=True, hide_index=True)
+    breakdown_table_display = add_total_row(
+        breakdown_table,
+        label_column="cost_element",
+        sum_columns=["cost_amount", "element_impact", "new_cost_amount"],
+    )
+    st.dataframe(
+        style_total_row(localize_dataframe(breakdown_table_display)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 with breakdown_cols[1]:
     st.subheader(tr("selected_component_cost_breakdown"))
