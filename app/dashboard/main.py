@@ -25,8 +25,15 @@ PARTS_PATH = DATA_DIR / "vehicle_parts.csv"
 BREAKDOWN_PATH = DATA_DIR / "part_cost_breakdown.csv"
 SUPPLIER_PATH = DATA_DIR / "supplier_master.csv"
 SUPPLIER_MAP_PATH = DATA_DIR / "part_supplier_map.csv"
+VEHICLE_MODELS_PATH = DATA_DIR / "vehicle_models.csv"
 SCENARIO_HISTORY_PATH = DATA_DIR / "scenario_history.csv"
-REQUIRED_DATA_PATHS = [PARTS_PATH, BREAKDOWN_PATH, SUPPLIER_PATH, SUPPLIER_MAP_PATH]
+REQUIRED_DATA_PATHS = [
+    PARTS_PATH,
+    BREAKDOWN_PATH,
+    SUPPLIER_PATH,
+    SUPPLIER_MAP_PATH,
+    VEHICLE_MODELS_PATH,
+]
 
 VEHICLE_CODE = "BYD-SEAL-EV-TH"
 VEHICLE_NAME = "BYD Seal EV Enterprise Cost Model"
@@ -159,6 +166,10 @@ DASHBOARD_CSS = """
         padding: 26px 30px;
         margin: 10px 0 22px 0;
         box-shadow: 0 22px 50px rgba(15, 23, 42, 0.24);
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 260px;
+        gap: 24px;
+        align-items: center;
     }
     .exec-eyebrow {
         color: #fecaca;
@@ -179,6 +190,14 @@ DASHBOARD_CSS = """
         font-size: 0.98rem;
         line-height: 1.5;
         max-width: 980px;
+    }
+    .exec-model-image {
+        width: 100%;
+        max-height: 160px;
+        object-fit: cover;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        box-shadow: 0 16px 38px rgba(0, 0, 0, 0.28);
     }
     .exec-kpi-grid {
         display: grid;
@@ -360,6 +379,7 @@ DASHBOARD_CSS = """
         }
         .exec-hero {
             padding: 22px 20px;
+            grid-template-columns: 1fr;
         }
     }
     @media (max-width: 1100px) {
@@ -410,11 +430,17 @@ dashboard_view = st.sidebar.radio(
 
 
 st.title(tr("app_title"))
-st.caption(f"{VEHICLE_CODE} | {VEHICLE_NAME}")
+st.caption(tr("multi_vehicle_platform_caption"))
 
 
 @st.cache_data
-def load_vehicle_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_vehicle_data() -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
     missing_paths = [path for path in REQUIRED_DATA_PATHS if not path.exists()]
     if missing_paths:
         missing_list = ", ".join(path.name for path in missing_paths)
@@ -426,6 +452,7 @@ def load_vehicle_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Da
         pd.read_csv(BREAKDOWN_PATH),
         pd.read_csv(SUPPLIER_PATH),
         pd.read_csv(SUPPLIER_MAP_PATH),
+        pd.read_csv(VEHICLE_MODELS_PATH),
     )
 
 
@@ -675,16 +702,49 @@ def validate_inputs(
     return errors
 
 
-parts_df, breakdown_df, suppliers_df, supplier_map_df = load_vehicle_data()
-if "inflation_factor" not in parts_df.columns:
-    parts_df["inflation_factor"] = 0.10
+all_parts_df, all_breakdown_df, suppliers_df, all_supplier_map_df, vehicle_models_df = (
+    load_vehicle_data()
+)
+if "inflation_factor" not in all_parts_df.columns:
+    all_parts_df["inflation_factor"] = 0.10
 
 ALL_MODULES = "All modules"
-module_options = [ALL_MODULES] + sorted(parts_df["module_name"].unique().tolist())
 
 with st.sidebar:
     if st.button(tr("reset_to_base_case"), use_container_width=True):
         reset_to_base_case()
+
+    st.subheader(tr("vehicle_model"))
+    selected_vehicle_code = st.selectbox(
+        tr("select_vehicle_model"),
+        vehicle_models_df["vehicle_code"].tolist(),
+        index=vehicle_models_df.index[
+            vehicle_models_df["vehicle_code"].eq(VEHICLE_CODE)
+        ].tolist()[0]
+        if vehicle_models_df["vehicle_code"].eq(VEHICLE_CODE).any()
+        else 0,
+        format_func=lambda code: vehicle_models_df.loc[
+            vehicle_models_df["vehicle_code"].eq(code),
+            "vehicle_name",
+        ].iloc[0],
+    )
+    selected_vehicle = vehicle_models_df[
+        vehicle_models_df["vehicle_code"].eq(selected_vehicle_code)
+    ].iloc[0]
+    if st.session_state.get("last_vehicle_code") != selected_vehicle_code:
+        st.session_state["selected_sales_price"] = float(
+            selected_vehicle["default_sales_price"]
+        )
+        st.session_state["last_vehicle_code"] = selected_vehicle_code
+    st.image(selected_vehicle["image_url"], use_container_width=True)
+    st.caption(f"{tr('model_description')}: {selected_vehicle['description']}")
+    selected_sales_price = st.number_input(
+        tr("sales_price"),
+        min_value=0.01,
+        value=float(selected_vehicle["default_sales_price"]),
+        step=max(float(selected_vehicle["default_sales_price"]) * 0.01, 1000.0),
+        key="selected_sales_price",
+    )
 
     st.subheader(tr("scenario_management"))
     scenario_name = st.text_input(tr("scenario_name"), "Base commodity scenario")
@@ -824,6 +884,22 @@ with st.sidebar:
             / 100
         )
 
+    parts_df = all_parts_df[all_parts_df["vehicle_code"].eq(selected_vehicle_code)].copy()
+    breakdown_df = all_breakdown_df[
+        all_breakdown_df["vehicle_code"].eq(selected_vehicle_code)
+    ].copy()
+    supplier_map_df = all_supplier_map_df[
+        all_supplier_map_df["vehicle_code"].eq(selected_vehicle_code)
+    ].copy()
+
+    base_part_sales_total = parts_df["sales_price"].sum()
+    if base_part_sales_total > 0:
+        parts_df["sales_price"] = (
+            parts_df["sales_price"] / base_part_sales_total * selected_sales_price
+        )
+
+    module_options = [ALL_MODULES] + sorted(parts_df["module_name"].unique().tolist())
+
     st.subheader(tr("bom_drilldown"))
     selected_module = st.selectbox(
         tr("select_module"),
@@ -835,13 +911,20 @@ with st.sidebar:
         part_scope = parts_df[parts_df["module_name"] == selected_module]
     selected_part_name = st.selectbox(tr("select_part"), part_scope["part_name"].tolist())
 
+st.caption(f"{selected_vehicle_code} | {selected_vehicle['vehicle_name']}")
+
 validation_errors = validate_inputs(parts_df, breakdown_df, price_scenarios)
 if validation_errors:
     for error in validation_errors:
         st.error(error)
     st.stop()
 
-breakdown_enriched = breakdown_df.merge(parts_df, on="part_code", how="left")
+breakdown_merge_keys = (
+    ["vehicle_code", "part_code"]
+    if "vehicle_code" in breakdown_df.columns and "vehicle_code" in parts_df.columns
+    else ["part_code"]
+)
+breakdown_enriched = breakdown_df.merge(parts_df, on=breakdown_merge_keys, how="left")
 breakdown_enriched = calculate_element_impacts(breakdown_enriched, driver_changes)
 
 traceability_frames = []
@@ -891,8 +974,13 @@ total_impact = total_new_cost - total_base_cost
 total_gp = total_sales_price - total_new_cost
 total_gp_percent = total_gp / total_sales_price * 100 if total_sales_price else 0
 
+supplier_merge_keys = (
+    ["vehicle_code", "part_code"]
+    if "vehicle_code" in supplier_map_df.columns and "vehicle_code" in results_df.columns
+    else ["part_code"]
+)
 supplier_detail_df = (
-    supplier_map_df.merge(results_df, on="part_code", how="left")
+    supplier_map_df.merge(results_df, on=supplier_merge_keys, how="left")
     .merge(suppliers_df, on="supplier_name", how="left")
 )
 supplier_detail_df["supplier_cost_base"] = (
@@ -1105,9 +1193,12 @@ if dashboard_view == "executive":
     render_html(
         f"""
         <div class="exec-hero">
-            <div class="exec-eyebrow">{escape(tr('app_title'))}</div>
-            <div class="exec-title">{escape(tr('executive_dashboard'))}</div>
-            <div class="exec-subtitle">{escape(tr('executive_dashboard_subtitle'))}</div>
+            <div>
+                <div class="exec-eyebrow">{escape(tr('app_title'))}</div>
+                <div class="exec-title">{escape(selected_vehicle['vehicle_name'])}</div>
+                <div class="exec-subtitle">{escape(str(selected_vehicle['description']))}</div>
+            </div>
+            <img class="exec-model-image" src="{escape(str(selected_vehicle['image_url']))}" alt="{escape(selected_vehicle['vehicle_name'])}">
         </div>
         """
     )
@@ -1123,12 +1214,28 @@ if dashboard_view == "executive":
 
     kpi_cards = [
         render_exec_kpi(
+            tr("sales_price"),
+            format_thb(selected_sales_price),
+            tr("vehicle_model"),
+            "&#3647;",
+            "#8f1118",
+            "&#9679;",
+        ),
+        render_exec_kpi(
             tr("total_vehicle_cost"),
             format_thb(total_new_cost),
             tr("cost_delta").format(delta=format_thb(total_impact)),
             "&#3647;",
             net_color,
             cost_trend,
+        ),
+        render_exec_kpi(
+            tr("gross_profit"),
+            format_thb(total_gp),
+            tr("gp_delta").format(delta=format_pct(total_gp_percent - base_gp_percent)),
+            "GP",
+            gp_color,
+            gp_trend,
         ),
         render_exec_kpi(
             tr("gp_percent"),
@@ -1494,6 +1601,9 @@ st.subheader(tr("scenario_save_compare"))
 scenario_row = {
     "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "scenario_name": scenario_name.strip(),
+    "vehicle_code": selected_vehicle_code,
+    "vehicle_name": selected_vehicle["vehicle_name"],
+    "sales_price": round(float(selected_sales_price), 2),
     "total_vehicle_cost": round(float(total_new_cost), 2),
     "gp_amount": round(float(total_gp), 2),
     "gp_percent": round(float(total_gp_percent), 4),

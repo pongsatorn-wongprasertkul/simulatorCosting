@@ -1,6 +1,11 @@
 TRANSLATIONS = {
     "language": "ภาษา",
     "app_title": "ระบบจำลองต้นทุนยานยนต์องค์กร BYD",
+    "multi_vehicle_platform_caption": "แพลตฟอร์มจำลองต้นทุนองค์กรแบบหลายรุ่นรถ",
+    "vehicle_model": "รุ่นรถ",
+    "select_vehicle_model": "เลือกรุ่นรถ",
+    "sales_price": "ราคาขาย",
+    "model_description": "คำอธิบายรุ่น",
     "dashboard_view": "มุมมองแดชบอร์ด",
     "executive_dashboard": "แดชบอร์ดผู้บริหาร",
     "analyst_dashboard": "แดชบอร์ดนักวิเคราะห์",

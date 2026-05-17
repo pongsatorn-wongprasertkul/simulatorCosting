@@ -1,6 +1,11 @@
 TRANSLATIONS = {
     "language": "Language",
     "app_title": "BYD Enterprise Automotive Cost Simulation",
+    "multi_vehicle_platform_caption": "Multi-vehicle enterprise cost simulation platform",
+    "vehicle_model": "Vehicle Model",
+    "select_vehicle_model": "Select Vehicle Model",
+    "sales_price": "Sales Price",
+    "model_description": "Model Description",
     "dashboard_view": "Dashboard View",
     "executive_dashboard": "Executive Dashboard",
     "analyst_dashboard": "Analyst Dashboard",
