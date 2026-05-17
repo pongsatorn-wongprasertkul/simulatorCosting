@@ -84,6 +84,8 @@ COST_ELEMENT_DRIVER_MAP = {
 }
 
 MONTE_CARLO_RUNS = 10000
+BATTERY_PACK_COST_USD_PER_KWH = 115.0
+PACK_INTEGRATION_FACTOR = 1.15
 SUPPLIER_RISK_SCORES = {
     "Low": 25,
     "Medium": 50,
@@ -166,10 +168,6 @@ DASHBOARD_CSS = """
         padding: 26px 30px;
         margin: 10px 0 22px 0;
         box-shadow: 0 22px 50px rgba(15, 23, 42, 0.24);
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 260px;
-        gap: 24px;
-        align-items: center;
     }
     .exec-eyebrow {
         color: #fecaca;
@@ -190,14 +188,6 @@ DASHBOARD_CSS = """
         font-size: 0.98rem;
         line-height: 1.5;
         max-width: 980px;
-    }
-    .exec-model-image {
-        width: 100%;
-        max-height: 160px;
-        object-fit: cover;
-        border-radius: 14px;
-        border: 1px solid rgba(255, 255, 255, 0.24);
-        box-shadow: 0 16px 38px rgba(0, 0, 0, 0.28);
     }
     .exec-kpi-grid {
         display: grid;
@@ -379,7 +369,6 @@ DASHBOARD_CSS = """
         }
         .exec-hero {
             padding: 22px 20px;
-            grid-template-columns: 1fr;
         }
     }
     @media (max-width: 1100px) {
@@ -464,6 +453,29 @@ def format_thb(value: float) -> str:
 
 def format_pct(value: float) -> str:
     return f"{value:.2f}%"
+
+
+def display_vehicle_image(image_source: object, caption: str | None = None) -> None:
+    image_text = "" if pd.isna(image_source) else str(image_source).strip()
+    if not image_text:
+        st.info(tr("no_vehicle_image_available"))
+        return
+
+    if image_text.startswith(("http://", "https://")):
+        try:
+            st.image(image_text, caption=caption, use_container_width=True)
+        except Exception:
+            st.info(tr("no_vehicle_image_available"))
+        return
+
+    image_path = Path(image_text)
+    if not image_path.is_absolute():
+        image_path = PROJECT_ROOT / image_path
+
+    if image_path.exists():
+        st.image(str(image_path), caption=caption, use_container_width=True)
+    else:
+        st.info(tr("no_vehicle_image_available"))
 
 
 def render_exec_kpi(
@@ -678,13 +690,6 @@ def validate_inputs(
         if scenario["scenario_price"] < 0:
             errors.append(f"{driver_name}: scenario price must be greater than or equal to 0.")
 
-    if (parts["sales_price"] <= 0).any():
-        bad_parts = parts.loc[parts["sales_price"] <= 0, "part_name"].tolist()
-        errors.append(
-            "Sales price must be greater than 0 for every part. "
-            f"Please check: {', '.join(bad_parts[:5])}."
-        )
-
     if (parts["total_base_cost"] < 0).any():
         bad_parts = parts.loc[parts["total_base_cost"] < 0, "part_name"].tolist()
         errors.append(
@@ -735,8 +740,11 @@ with st.sidebar:
         st.session_state["selected_sales_price"] = float(
             selected_vehicle["default_sales_price"]
         )
+        st.session_state["selected_gp_target_percent"] = float(
+            selected_vehicle["target_gp_percent"]
+        )
         st.session_state["last_vehicle_code"] = selected_vehicle_code
-    st.image(selected_vehicle["image_url"], use_container_width=True)
+    display_vehicle_image(selected_vehicle["image_url"], str(selected_vehicle["vehicle_name"]))
     st.caption(f"{tr('model_description')}: {selected_vehicle['description']}")
     selected_sales_price = st.number_input(
         tr("sales_price"),
@@ -786,8 +794,9 @@ with st.sidebar:
         tr("target_gp"),
         min_value=0.0,
         max_value=100.0,
-        value=12.0,
+        value=float(selected_vehicle["target_gp_percent"]),
         step=0.5,
+        key="selected_gp_target_percent",
     )
     monte_carlo_config = {}
     for driver_name, defaults in DRIVER_PRICE_DEFAULTS.items():
@@ -892,11 +901,63 @@ with st.sidebar:
         all_supplier_map_df["vehicle_code"].eq(selected_vehicle_code)
     ].copy()
 
-    base_part_sales_total = parts_df["sales_price"].sum()
-    if base_part_sales_total > 0:
-        parts_df["sales_price"] = (
-            parts_df["sales_price"] / base_part_sales_total * selected_sales_price
+    target_total_cost = selected_sales_price * (1 - gp_target_percent / 100)
+    current_total_cost = parts_df["total_base_cost"].sum()
+    if current_total_cost > 0:
+        normalization_scale = target_total_cost / current_total_cost
+        parts_df["total_base_cost"] = parts_df["total_base_cost"] * normalization_scale
+        breakdown_df["cost_amount"] = breakdown_df["cost_amount"] * normalization_scale
+
+    cost_difference = target_total_cost - parts_df["total_base_cost"].sum()
+    if not parts_df.empty:
+        parts_df.loc[parts_df.index[-1], "total_base_cost"] += cost_difference
+
+    part_cost_targets = parts_df.set_index("part_code")["total_base_cost"].to_dict()
+    for part_code, part_target_cost in part_cost_targets.items():
+        part_breakdown_index = breakdown_df.index[breakdown_df["part_code"].eq(part_code)]
+        if len(part_breakdown_index) == 0:
+            continue
+        part_difference = part_target_cost - breakdown_df.loc[
+            part_breakdown_index,
+            "cost_amount",
+        ].sum()
+        breakdown_df.loc[part_breakdown_index[-1], "cost_amount"] += part_difference
+
+    parts_df["sales_price"] = (
+        parts_df["total_base_cost"] / target_total_cost * selected_sales_price
+        if target_total_cost
+        else 0
+    )
+
+    battery_budget = parts_df.loc[
+        parts_df["module_name"].eq("Battery System"),
+        "total_base_cost",
+    ].sum()
+    battery_cost = (
+        float(selected_vehicle["battery_kwh"])
+        * BATTERY_PACK_COST_USD_PER_KWH
+        * price_scenarios["FX Rate"]["current_price"]
+        * PACK_INTEGRATION_FACTOR
+    )
+    battery_share_percent = battery_budget / target_total_cost * 100 if target_total_cost else 0
+    benchmark_warnings = []
+    if abs(battery_cost - battery_budget) > max(battery_budget * 0.05, 1):
+        benchmark_warnings.append(
+            tr("battery_budget_warning").format(
+                calculated=format_thb(battery_cost),
+                budget=format_thb(battery_budget),
+            )
         )
+    if not 30 <= battery_share_percent <= 40:
+        benchmark_warnings.append(
+            tr("battery_share_warning").format(share=format_pct(battery_share_percent))
+        )
+    if not 18 <= gp_target_percent <= 30:
+        benchmark_warnings.append(
+            tr("gp_target_warning").format(gp=format_pct(gp_target_percent))
+        )
+    if target_total_cost > selected_sales_price:
+        benchmark_warnings.append(tr("total_cost_above_sales_warning"))
 
     module_options = [ALL_MODULES] + sorted(parts_df["module_name"].unique().tolist())
 
@@ -918,6 +979,23 @@ if validation_errors:
     for error in validation_errors:
         st.error(error)
     st.stop()
+
+cost_validation_warnings = []
+if abs(parts_df["total_base_cost"].sum() - target_total_cost) > 0.5:
+    cost_validation_warnings.append(tr("vehicle_cost_validation_warning"))
+module_cost_total = parts_df.groupby("module_name")["total_base_cost"].sum().sum()
+if abs(module_cost_total - target_total_cost) > 0.5:
+    cost_validation_warnings.append(tr("module_cost_validation_warning"))
+breakdown_part_totals = breakdown_df.groupby("part_code")["cost_amount"].sum()
+part_cost_targets = parts_df.set_index("part_code")["total_base_cost"]
+part_cost_mismatch = (
+    breakdown_part_totals.sub(part_cost_targets, fill_value=0).abs() > 0.5
+).any()
+if part_cost_mismatch:
+    cost_validation_warnings.append(tr("part_breakdown_validation_warning"))
+
+for warning in benchmark_warnings + cost_validation_warnings:
+    st.warning(warning)
 
 breakdown_merge_keys = (
     ["vehicle_code", "part_code"]
@@ -1198,10 +1276,10 @@ if dashboard_view == "executive":
                 <div class="exec-title">{escape(selected_vehicle['vehicle_name'])}</div>
                 <div class="exec-subtitle">{escape(str(selected_vehicle['description']))}</div>
             </div>
-            <img class="exec-model-image" src="{escape(str(selected_vehicle['image_url']))}" alt="{escape(selected_vehicle['vehicle_name'])}">
         </div>
         """
     )
+    display_vehicle_image(selected_vehicle["image_url"], str(selected_vehicle["vehicle_name"]))
 
     cost_trend = "&#8593;" if total_impact > 0 else "&#8595;" if total_impact < 0 else "&#8594;"
     gp_trend = "&#8593;" if total_gp_percent >= base_gp_percent else "&#8595;"

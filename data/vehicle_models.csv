@@ -1,6 +1,6 @@
-﻿vehicle_code,vehicle_name,segment,image_url,default_sales_price,currency,description
-BYD-DOLPHIN-TH,BYD Dolphin,Compact EV Hatchback,https://images.squarespace-cdn.com/content/v1/6527b5ece04b97628471bfd2/e14cd007-c7a0-45f5-a3bd-3a717b485d71/new-dolphin-frost-white-Stz-z196011367717.png,699999,THB,Compact electric hatchback focused on urban efficiency and low total ownership cost.
-BYD-ATTO3-TH,BYD Atto 3,Compact EV SUV,https://i.pinimg.com/736x/93/38/4d/93384dfb2bf1c913cb5792467b9b098f.jpg,899900,THB,"Compact electric SUV with balanced battery, electronics, and chassis cost structure."
-BYD-SEAL-EV-TH,BYD Seal,Electric Sedan,https://freebiehive.com/wp-content/uploads/2024/04/BYD-Seal-Car-PNG.jpg,1325000,THB,Premium electric sedan baseline for enterprise commodity and supplier simulation.
-BYD-SEALION6-TH,BYD Sealion 6,Plug-in Hybrid SUV,https://freebiehive.com/wp-content/uploads/2025/05/BYD-Sealion-6-PNG.jpg,939900,THB,"SUV platform with higher chassis, logistics, and quality exposure for family use cases."
-BYD-M6-TH,BYD M6,Electric MPV,https://www.reverautomotive.com/images/model/m6/color/m6-quantum-black.png,829900,THB,"Electric MPV with larger body, interior, seating, and logistics cost footprint."
+﻿"vehicle_code","vehicle_name","segment","default_sales_price","target_gp_percent","battery_kwh","image_url","currency","description"
+"BYD-DOLPHIN-TH","BYD Dolphin","Compact EV Hatchback","699999","22","44.9","assets/vehicles/byd_dolphin.png","THB","Compact electric hatchback benchmark cost model using EV industry allocation assumptions."
+"BYD-ATTO3-TH","BYD Atto 3","Compact EV SUV","899900","23","60.5","assets/vehicles/byd_atto3.png","THB","Compact electric SUV benchmark with higher battery, electronics, and body allocation."
+"BYD-SEAL-EV-TH","BYD Seal","Electric Sedan","1325000","24","82.5","assets/vehicles/byd_seal.png","THB","Premium electric sedan benchmark with larger battery and electric drive cost exposure."
+"BYD-SEALION6-TH","BYD Sealion 6","Plug-in Hybrid SUV","939900","22","18.3","assets/vehicles/byd_sealion6.png","THB","Plug-in hybrid SUV benchmark with SUV body and multi-powertrain cost structure."
+"BYD-M6-TH","BYD M6","Electric MPV","829900","21","71.8","assets/vehicles/byd_m6.png","THB","Electric MPV benchmark with larger interior, body, and people-carrier logistics footprint."
